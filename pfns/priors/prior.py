@@ -82,6 +82,8 @@ class Batch:
     )
     info_used_with_gradient_magnitudes: Optional[dict] = None
     gradient_multipliers: Optional[torch.Tensor] = None
+    task_indices: Optional[torch.Tensor] = None
+    num_tasks: Optional[int] = None
 
     def other_filled_attributes(
         self, set_of_attributes: Set[str] = frozenset(("x", "y", "target_y"))
