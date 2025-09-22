@@ -28,6 +28,7 @@ class TransformerConfig(base_config.BaseConfig):
     nhead: int = 2
     features_per_group: int = 1
     attention_between_features: bool = True
+    use_task_hierarchy: bool = False
     model_extra_args: tp.Dict[str, base_config.BaseTypes] | None = None
 
     def create_model(self) -> transformer.TableTransformer:
@@ -78,6 +79,7 @@ class TransformerConfig(base_config.BaseConfig):
             nlayers=self.nlayers,
             nhead=self.nhead,
             attention_between_features=self.attention_between_features,
+            use_task_hierarchy=self.use_task_hierarchy,
             style_encoder=style_encoder,
             y_style_encoder=y_style_encoder,
             batch_first=True,  # model is batch_first by default now

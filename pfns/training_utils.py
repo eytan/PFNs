@@ -164,3 +164,22 @@ def move_style_and_check_shape(
                 f"and {x.shape=}"
             )
     return style
+
+
+def move_task_partition_and_check_shape(
+    task_partition: torch.Tensor | None, x: torch.Tensor, device: torch.device
+) -> torch.Tensor | None:
+    if task_partition is None:
+        return None
+
+    if task_partition.dim() != 2:
+        raise ValueError(
+            "task_partition must be a 2D tensor of shape (batch, seq_len)"
+        )
+
+    if task_partition.shape[0] != x.shape[0] or task_partition.shape[1] != x.shape[1]:
+        raise ValueError(
+            "task_partition must match the batch and sequence dimensions of x"
+        )
+
+    return task_partition.to(device).long()

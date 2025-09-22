@@ -25,6 +25,7 @@ from .priors import data_loading, prior, utils as priors_utils
 from .training_utils import (
     Metrics,
     move_style_and_check_shape,
+    move_task_partition_and_check_shape,
     move_y_style_and_check_shape,
     set_model_to,
     update_importance_sampling_infos,
@@ -466,6 +467,9 @@ def train_or_evaluate_epoch(
                         style=move_style_and_check_shape(batch.style, batch.x, device),
                         y_style=move_y_style_and_check_shape(
                             batch.y_style, batch.y, device
+                        ),
+                        task_partition=move_task_partition_and_check_shape(
+                            batch.task_partition, batch.x, device
                         ),
                         only_return_standard_out=True,
                     )  # shape: (batch_size, test_len)
