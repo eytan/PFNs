@@ -15,6 +15,9 @@ from pfns.model.encoders import (
     SequentialEncoder,
 )
 from pfns.model.layer import PerFeatureLayer
+from pfns.model.layer_norm import LayerNorm
+from pfns.model.mlp import MLP
+from pfns.model.multi_head_attention import MultiHeadAttention
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
@@ -69,6 +72,7 @@ class TableTransformer(nn.Module):
         y_style_encoder: nn.Module | None = None,
         attention_between_features: bool = True,
         batch_first: bool = True,
+        use_task_hierarchy: bool = False,
         **layer_kwargs: Any,
     ):
         """Initializes the PerFeatureTransformer module.
@@ -142,6 +146,11 @@ class TableTransformer(nn.Module):
 
         super().__init__()
 
+        if use_task_hierarchy and cache_trainset_representation:
+            raise ValueError(
+                "cache_trainset_representation is not supported when use_task_hierarchy is True"
+            )
+
         if encoder is None:
             print("Using linear x encoder, as no encoder was provided.")
             encoder = get_linear_x_encoder(ninp, features_per_group)
@@ -160,6 +169,7 @@ class TableTransformer(nn.Module):
         self.cached_embeddings: torch.Tensor | None = None
         self.attention_between_features = attention_between_features
         self.batch_first = batch_first
+        self.use_task_hierarchy = use_task_hierarchy
 
         def layer_creator():
             return PerFeatureLayer(
@@ -177,12 +187,23 @@ class TableTransformer(nn.Module):
 
         nlayers_encoder = nlayers
 
-        self.transformer_layers = LayerStack(
-            layer_creator=layer_creator,
-            num_layers=nlayers_encoder,
-            recompute_each_layer=recompute_layer,
-            min_num_layers_layer_dropout=min_num_layers_layer_dropout,
-        )
+        if use_task_hierarchy:
+            self.transformer_layers = HierarchicalLayerStack(
+                layer_creator=layer_creator,
+                num_layers=nlayers_encoder,
+                ninp=ninp,
+                nhid=nhid,
+                nhead=nhead,
+                recompute_each_layer=recompute_layer,
+                min_num_layers_layer_dropout=min_num_layers_layer_dropout,
+            )
+        else:
+            self.transformer_layers = LayerStack(
+                layer_creator=layer_creator,
+                num_layers=nlayers_encoder,
+                recompute_each_layer=recompute_layer,
+                min_num_layers_layer_dropout=min_num_layers_layer_dropout,
+            )
 
         initialized_decoder_dict = {}
         for decoder_key in decoder_dict:
@@ -222,6 +243,7 @@ class TableTransformer(nn.Module):
         test_x: torch.Tensor | None = None,
         style: torch.Tensor | None = None,
         y_style: torch.Tensor | None = None,
+        task_partition: torch.Tensor | None = None,
         only_return_standard_out: bool = True,
         **kwargs,
     ) -> dict[str, torch.Tensor]:  # noqa: D417
@@ -243,6 +265,8 @@ class TableTransformer(nn.Module):
                 When predicting from cached trainset representations, test_x can be None (using x instead) or contain the test set.
             style: (batch_size, style_dim) or (batch_size, num_features, style_dim) The style vector. Assumed batch-first.
             y_style: (batch_size, style_dim) The style vector for the y data. Assumed batch-first.
+            task_partition: Optional tensor describing task membership per sequence item.
+                Shape: (batch_size, seq_len_train | seq_len_train + seq_len_test).
             only_return_standard_out: If True, only the standard output is returned.
             **kwargs: Keyword arguments passed to the `_forward` method:
                 - `categorical_inds`: The indices of categorical features. A single list of indices for the whole batch:
@@ -255,6 +279,7 @@ class TableTransformer(nn.Module):
         x_bf = x.clone() if x is not None else None
         y_bf = y.clone() if y is not None else None
         test_x_bf = test_x.clone() if test_x is not None else None
+        task_partition_bf = task_partition.clone() if task_partition is not None else None
 
         if not self.batch_first:
             if x_bf is not None:
@@ -265,6 +290,8 @@ class TableTransformer(nn.Module):
                     y_bf = y_bf.transpose(0, 1)
             if test_x_bf is not None:
                 test_x_bf = test_x_bf.transpose(0, 1)
+            if task_partition_bf is not None:
+                task_partition_bf = task_partition_bf.transpose(0, 1)
 
         # Now x_bf, y_bf, test_x_bf are batch-first (or None)
 
@@ -295,6 +322,10 @@ class TableTransformer(nn.Module):
                     x_bf.shape[1] == single_eval_pos
                 ), f"Batch-first x sequence length {x_bf.shape[1]} must match single_eval_pos {single_eval_pos} for concatenation"
                 x_bf = torch.cat((x_bf, test_x_bf), dim=1)
+                if task_partition_bf is not None:
+                    raise ValueError(
+                        "task_partition must already include the concatenated sequence"
+                    )
 
         # Call _forward with batch-first tensors
         output_decoded = self._forward(
@@ -303,6 +334,7 @@ class TableTransformer(nn.Module):
             single_eval_pos=single_eval_pos,  # This is the length of the training part of the sequence
             style=style,  # style is assumed batch-first from input
             y_style=y_style,  # y_style is assumed batch-first from input
+            task_partition=task_partition_bf,
             **kwargs,  # contains only_return_standard_out, categorical_inds, half_layers
         )
 
@@ -324,6 +356,7 @@ class TableTransformer(nn.Module):
         | None = None,  # Length of the training part of the sequence
         style: torch.Tensor | None = None,  # Assumed batch-first
         y_style: torch.Tensor | None = None,  # Assumed batch-first
+        task_partition: torch.Tensor | None = None,
         categorical_inds: list[int] | None = None,
         half_layers: bool = False,
     ) -> Any | dict[str, torch.Tensor]:
@@ -353,6 +386,19 @@ class TableTransformer(nn.Module):
         # x is now a dict of batch-first tensors: x[k] is (batch_size, seq_len, features)
 
         _batch_size, _seq_len, _num_features_orig_main = x["main"].shape
+
+        if self.use_task_hierarchy:
+            if task_partition is None:
+                raise ValueError(
+                    "task_partition must be provided when use_task_hierarchy is True"
+                )
+            if task_partition.shape[0] != _batch_size or task_partition.shape[1] != _seq_len:
+                raise ValueError(
+                    "task_partition must have shape (batch_size, seq_len)"
+                )
+            task_partition = task_partition.to(x["main"].device).long()
+        else:
+            task_partition = None
 
         if (
             y is None
@@ -599,7 +645,16 @@ class TableTransformer(nn.Module):
                 (full_embedded_style, embedded_input),
                 dim=1,  # Concatenate along sequence dimension
             )
-            current_context_len += 1  # Context length for attention now includes style
+            added_style_tokens = full_embedded_style.shape[1]
+            current_context_len += added_style_tokens
+            if task_partition is not None:
+                style_assignment = torch.full(
+                    (task_partition.shape[0], added_style_tokens),
+                    -1,
+                    dtype=task_partition.dtype,
+                    device=task_partition.device,
+                )
+                task_partition = torch.cat((style_assignment, task_partition), dim=1)
 
         if torch.isnan(embedded_input).any():
             raise ValueError(
@@ -610,12 +665,24 @@ class TableTransformer(nn.Module):
             )
         del embedded_y, embedded_x
 
-        encoder_out = self.transformer_layers(
-            embedded_input,  # (b s_effective (num_groups+1_for_y) e)
-            single_eval_pos=current_context_len,  # Pass the context length including style
-            half_layers=half_layers,
-            cache_trainset_representation=self.cache_trainset_representation,
-        )  # b s (num_groups+1_for_y) e -> b s (num_groups+1_for_y) e
+        if task_partition is not None and task_partition.shape[1] != embedded_input.shape[1]:
+            raise ValueError("task_partition must align with the sequence dimension after style tokens")
+
+        if self.use_task_hierarchy:
+            encoder_out = self.transformer_layers(
+                embedded_input,
+                single_eval_pos=current_context_len,
+                half_layers=half_layers,
+                cache_trainset_representation=False,
+                task_partition=task_partition,
+            )
+        else:
+            encoder_out = self.transformer_layers(
+                embedded_input,
+                single_eval_pos=current_context_len,
+                half_layers=half_layers,
+                cache_trainset_representation=self.cache_trainset_representation,
+            )
 
         del embedded_input
 
@@ -743,6 +810,281 @@ class TableTransformer(nn.Module):
 
 
 ### Utility functions
+
+
+class HierarchicalLayer(nn.Module):
+    def __init__(
+        self,
+        *,
+        per_feature_layer: PerFeatureLayer,
+        ninp: int,
+        nhid: int,
+        nhead: int,
+    ) -> None:
+        super().__init__()
+        self.intra_layer: PerFeatureLayer = per_feature_layer
+        if ninp % nhead != 0:
+            raise ValueError("ninp must be divisible by nhead for task attention")
+        device = per_feature_layer.mlp.linear1.weight.device
+        dtype = per_feature_layer.mlp.linear1.weight.dtype
+        self.task_attention = MultiHeadAttention(
+            input_size=ninp,
+            output_size=ninp,
+            d_k=ninp // nhead,
+            d_v=ninp // nhead,
+            nhead=nhead,
+            device=device,
+            dtype=dtype,
+            initialize_output_to_zero=True,
+        )
+        self.task_norm1 = LayerNorm(
+            ninp,
+            elementwise_affine=True,
+            device=device,
+            dtype=dtype,
+        )
+        self.task_mlp = MLP(
+            size=ninp,
+            hidden_size=nhid,
+            activation="gelu",
+            device=device,
+            dtype=dtype,
+            initialize_output_to_zero=True,
+        )
+        self.task_norm2 = LayerNorm(
+            ninp,
+            elementwise_affine=True,
+            device=device,
+            dtype=dtype,
+        )
+        self.task_to_item = nn.Linear(ninp, ninp, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        *,
+        task_partition: torch.Tensor,
+        single_eval_pos: int | None,
+        cache_trainset_representation: bool = False,
+        **_: Any,
+    ) -> torch.Tensor:
+        if cache_trainset_representation:
+            raise ValueError(
+                "cache_trainset_representation is not supported for hierarchical layers"
+            )
+
+        processed = self._apply_intra_task(
+            state,
+            task_partition=task_partition,
+            single_eval_pos=single_eval_pos or 0,
+        )
+        return self._apply_inter_task(processed, task_partition)
+
+    def _apply_intra_task(
+        self,
+        state: torch.Tensor,
+        *,
+        task_partition: torch.Tensor,
+        single_eval_pos: int,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _, _ = state.shape
+        device = state.device
+        train_mask = (
+            torch.arange(seq_len, device=device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            < single_eval_pos
+        )
+
+        outputs = []
+        for batch_idx in range(batch_size):
+            state_b = state[batch_idx]
+            partition_b = task_partition[batch_idx]
+            style_mask = partition_b == -1
+            style_tokens = state_b[style_mask]
+            style_updates = torch.zeros_like(style_tokens)
+            style_train_len = int((train_mask[batch_idx] & style_mask).sum().item())
+            task_ids = [int(t) for t in torch.unique(partition_b).tolist() if t >= 0]
+            output_b = state_b.clone()
+
+            for task_id in task_ids:
+                task_mask = partition_b == task_id
+                if not task_mask.any():
+                    continue
+                task_tokens = state_b[task_mask]
+                task_train_len = int((train_mask[batch_idx] & task_mask).sum().item())
+                combined_tokens = task_tokens
+                local_single_eval_pos = task_train_len
+                if style_tokens.shape[0] > 0:
+                    combined_tokens = torch.cat((style_tokens, task_tokens), dim=0)
+                    local_single_eval_pos += style_train_len
+
+                combined_tokens = combined_tokens.unsqueeze(0)
+                processed = self.intra_layer(
+                    combined_tokens,
+                    single_eval_pos=local_single_eval_pos,
+                    cache_trainset_representation=False,
+                )[0]
+
+                if style_tokens.shape[0] > 0:
+                    style_updates = style_updates + processed[: style_tokens.shape[0]]
+                    output_b[task_mask] = processed[style_tokens.shape[0] :]
+                else:
+                    output_b[task_mask] = processed
+
+            if style_tokens.shape[0] > 0:
+                if task_ids:
+                    output_b[style_mask] = style_updates / len(task_ids)
+                else:
+                    output_b[style_mask] = style_tokens
+
+            outputs.append(output_b)
+
+        return torch.stack(outputs, dim=0)
+
+    def _apply_inter_task(
+        self,
+        state: torch.Tensor,
+        task_partition: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = state.shape[0]
+        summaries: list[torch.Tensor] = []
+        task_ids_per_batch: list[list[int]] = []
+
+        for batch_idx in range(batch_size):
+            partition_b = task_partition[batch_idx]
+            task_ids = [int(t) for t in torch.unique(partition_b).tolist() if t >= 0]
+            task_ids_per_batch.append(task_ids)
+            if not task_ids:
+                summaries.append(state.new_zeros((0, state.shape[-1])))
+                continue
+
+            summary_vectors = []
+            for task_id in task_ids:
+                task_mask = partition_b == task_id
+                task_values = state[batch_idx, task_mask, -1, :]
+                if task_values.numel() == 0:
+                    summary_vectors.append(torch.zeros(state.shape[-1], device=state.device, dtype=state.dtype))
+                else:
+                    summary_vectors.append(task_values.mean(dim=0))
+            summaries.append(torch.stack(summary_vectors, dim=0))
+
+        updated_summaries: list[torch.Tensor] = []
+        for summary in summaries:
+            if summary.shape[0] == 0:
+                updated_summaries.append(summary)
+                continue
+            summary_input = summary.unsqueeze(0)
+            attn_out = self.task_attention(
+                summary_input,
+                add_input=True,
+                allow_inplace=True,
+            )
+            attn_out = self.task_norm1(attn_out, allow_inplace=True)
+            attn_out = self.task_mlp(
+                attn_out,
+                add_input=True,
+                allow_inplace=True,
+            )
+            attn_out = self.task_norm2(attn_out, allow_inplace=True)
+            updated_summaries.append(attn_out.squeeze(0))
+
+        updated_state = state.clone()
+        for batch_idx, task_ids in enumerate(task_ids_per_batch):
+            if not task_ids:
+                continue
+            summary_updates = updated_summaries[batch_idx]
+            partition_b = task_partition[batch_idx]
+            for idx, task_id in enumerate(task_ids):
+                task_mask = partition_b == task_id
+                if not task_mask.any():
+                    continue
+                update_vec = self.task_to_item(summary_updates[idx])
+                updated_state[batch_idx, task_mask, -1, :] += update_vec
+
+            style_mask = partition_b == -1
+            if style_mask.any():
+                style_update = summary_updates.mean(dim=0)
+                updated_state[batch_idx, style_mask, -1, :] += self.task_to_item(style_update)
+
+        return updated_state
+
+
+class HierarchicalLayerStack(nn.Module):
+    def __init__(
+        self,
+        *,
+        layer_creator: Callable[[], nn.Module],
+        num_layers: int,
+        ninp: int,
+        nhid: int,
+        nhead: int,
+        recompute_each_layer: bool = False,
+        min_num_layers_layer_dropout: int | None = None,
+    ) -> None:
+        super().__init__()
+        layers: list[HierarchicalLayer] = []
+        detected_nhead = None
+        for _ in range(num_layers):
+            layer_instance = layer_creator()
+            if not isinstance(layer_instance, PerFeatureLayer):
+                raise TypeError("layer_creator must create PerFeatureLayer instances")
+            if detected_nhead is None:
+                detected_nhead = layer_instance.self_attn_between_items._nhead
+            elif detected_nhead != layer_instance.self_attn_between_items._nhead:
+                raise ValueError("All created layers must use the same number of heads")
+            layers.append(
+                HierarchicalLayer(
+                    per_feature_layer=layer_instance,
+                    ninp=ninp,
+                    nhid=nhid,
+                    nhead=nhead,
+                )
+            )
+        self.layers = nn.ModuleList(layers)
+        self.num_layers = num_layers
+        self.min_num_layers_layer_dropout = (
+            min_num_layers_layer_dropout
+            if min_num_layers_layer_dropout is not None
+            else num_layers
+        )
+        self.recompute_each_layer = recompute_each_layer
+        self.nhead = nhead
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        task_partition: torch.Tensor,
+        single_eval_pos: int | None = None,
+        half_layers: bool = False,
+        cache_trainset_representation: bool = False,
+        **_: Any,
+    ) -> torch.Tensor:
+        if half_layers:
+            assert (
+                self.min_num_layers_layer_dropout == self.num_layers
+            ), "half_layers only works without layer dropout"
+            n_layers = self.num_layers // 2
+        else:
+            n_layers = torch.randint(
+                low=self.min_num_layers_layer_dropout,
+                high=self.num_layers + 1,
+                size=(1,),
+            ).item()
+
+        for layer in self.layers[:n_layers]:
+            layer_fn = partial(
+                layer,
+                task_partition=task_partition,
+                single_eval_pos=single_eval_pos,
+                cache_trainset_representation=cache_trainset_representation,
+            )
+            if self.recompute_each_layer and x.requires_grad:
+                x = checkpoint(layer_fn, x, use_reentrant=False)
+            else:
+                x = layer_fn(x)
+        return x
 
 
 class LayerStack(nn.Module):
