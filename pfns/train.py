@@ -18,6 +18,7 @@ from tqdm import tqdm
 from . import base_config, utils
 from .batch_shape_sampler import BatchShapeSamplerConfig
 from .model.transformer_config import TransformerConfig
+from .model.criterions import HistogramLoss
 from .optimizer import OptimizerConfig
 
 from .priors import data_loading, prior, utils as priors_utils
@@ -615,7 +616,9 @@ def compute_losses(
     output = einops.rearrange(output, "b s t l -> (b t) s l")
     targets = einops.rearrange(targets, "b s t -> (b t) s")
 
-    if isinstance(criterion, nn.GaussianNLLLoss):
+    if isinstance(criterion, HistogramLoss):
+        losses = criterion(output, targets)
+    elif isinstance(criterion, nn.GaussianNLLLoss):
         assert (
             output.shape[-1] == 2
         ), "need to write a little bit of code to handle multiple regression targets at once"
