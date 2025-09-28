@@ -11,13 +11,27 @@ from .bar_distribution import BarDistributionConfig
 class HistogramLoss(nn.Module):
     """Differentiable histogram loss operating on cosine similarities.
 
-    The implementation follows the differentiable histogram loss formulation
-    introduced for metric learning. Positive and negative pair similarities are
-    softly assigned to histogram bins using triangular kernels. The loss is the
-    expected probability that a randomly drawn negative pair has a higher
-    similarity than a randomly drawn positive pair. As the training loop expects
-    a loss per time-step, the per-item scalar loss is broadcast over the
+    The implementation mirrors the histogram loss introduced by Ustinova &
+    Lempitsky, *Learning Deep Embeddings with Histogram Loss*, NeurIPS 2016.
+    Positive and negative pair similarities are softly assigned to histogram
+    bins using triangular kernels, yielding smooth empirical similarity
+    distributions. Integrating the positive histogram against the tail of the
+    negative histogram approximates the probability that a randomly drawn
+    negative pair outranks a positive one, so minimising the loss encourages
+    tighter positive clusters and separates negatives. As the training loop
+    expects a loss per time-step, the per-item scalar loss is broadcast over the
     sequence dimension before returning.
+
+    Notes:
+        * ``num_bins`` controls the resolution of the soft histogram. The
+          default of 32 bins matches the configuration used in the original
+          paper; increase it (e.g. 128–256) for sharper similarity estimates
+          when working with distributions such as :class:`BarDistribution` that
+          expose many bins.
+        * We operate on cosine similarities to make the loss invariant to the
+          embedding scale. Embeddings are L2-normalised with
+          ``torch.nn.functional.normalize``, which is differentiable and stable
+          thanks to the internal ``eps`` argument.
     """
 
     def __init__(
