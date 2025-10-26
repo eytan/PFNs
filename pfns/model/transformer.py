@@ -16,6 +16,7 @@ from pfns.model.encoders import (
 )
 from pfns.model.layer import PerFeatureLayer
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 DEFAULT_EMSIZE = 128
@@ -69,6 +70,8 @@ class TableTransformer(nn.Module):
         y_style_encoder: nn.Module | None = None,
         attention_between_features: bool = True,
         batch_first: bool = True,
+        use_hierarchical_attention: bool = False,
+        use_task_summary_projection: bool = True,
         **layer_kwargs: Any,
     ):
         """Initializes the PerFeatureTransformer module.
@@ -123,6 +126,13 @@ class TableTransformer(nn.Module):
             batch_first: If True, then the input and output tensors are provided
                 as (batch, seq, feature). Default is True. If False,
                 (seq, batch, feature).
+            use_hierarchical_attention: If True, summary tokens computed from the
+                training portion of the batch are prepended before the transformer
+                layers. This keeps the default TabPFNv2 blocks while enabling
+                multi-task information sharing.
+            use_task_summary_projection: Apply a learnable projection to the summary
+                tokens before adding them to the sequence. Ignored if
+                `use_hierarchical_attention` is False.
             layer_kwargs: Keyword arguments passed to the `PerFeatureEncoderLayer`.
                 Possible arguments include:
                 - `layer_norm_eps`: Epsilon for layer normalization.
@@ -160,6 +170,10 @@ class TableTransformer(nn.Module):
         self.cached_embeddings: torch.Tensor | None = None
         self.attention_between_features = attention_between_features
         self.batch_first = batch_first
+        self.use_hierarchical_attention = use_hierarchical_attention
+        self.task_summary_proj: nn.Module | None = None
+        if self.use_hierarchical_attention and use_task_summary_projection:
+            self.task_summary_proj = nn.Linear(ninp, ninp)
 
         def layer_creator():
             return PerFeatureLayer(
@@ -252,6 +266,9 @@ class TableTransformer(nn.Module):
 
         # Prepare batch-first versions of x, y, test_x for _forward
         # and clone all to be sure not to change outside data
+        task_indices = kwargs.pop("task_indices", None)
+        num_tasks = kwargs.pop("num_tasks", None)
+
         x_bf = x.clone() if x is not None else None
         y_bf = y.clone() if y is not None else None
         test_x_bf = test_x.clone() if test_x is not None else None
@@ -265,6 +282,8 @@ class TableTransformer(nn.Module):
                     y_bf = y_bf.transpose(0, 1)
             if test_x_bf is not None:
                 test_x_bf = test_x_bf.transpose(0, 1)
+            if task_indices is not None:
+                task_indices = task_indices.transpose(0, 1)
 
         # Now x_bf, y_bf, test_x_bf are batch-first (or None)
 
@@ -303,6 +322,8 @@ class TableTransformer(nn.Module):
             single_eval_pos=single_eval_pos,  # This is the length of the training part of the sequence
             style=style,  # style is assumed batch-first from input
             y_style=y_style,  # y_style is assumed batch-first from input
+            task_indices=task_indices,
+            num_tasks=num_tasks,
             **kwargs,  # contains only_return_standard_out, categorical_inds, half_layers
         )
 
@@ -326,6 +347,8 @@ class TableTransformer(nn.Module):
         y_style: torch.Tensor | None = None,  # Assumed batch-first
         categorical_inds: list[int] | None = None,
         half_layers: bool = False,
+        task_indices: torch.Tensor | None = None,
+        num_tasks: int | None = None,
     ) -> Any | dict[str, torch.Tensor]:
         """The core forward pass of the model. Assumes batch-first inputs for x and y."""
         # Assertions and initial setup
@@ -351,6 +374,10 @@ class TableTransformer(nn.Module):
         else:  # x is a tensor
             x = {"main": x}
         # x is now a dict of batch-first tensors: x[k] is (batch_size, seq_len, features)
+
+        if task_indices is not None:
+            primary_value = next(iter(x.values()))
+            task_indices = task_indices.to(device=primary_value.device).long()
 
         _batch_size, _seq_len, _num_features_orig_main = x["main"].shape
 
@@ -552,6 +579,16 @@ class TableTransformer(nn.Module):
             # b s 1 e + b s 1 e -> b s 1 e
             embedded_input = embedded_x + embedded_y.unsqueeze(2)
 
+        summary_tokens: torch.Tensor | None = None
+        summary_token_count = 0
+        if self.use_hierarchical_attention:
+            summary_tokens, summary_token_count = self._build_task_summary_tokens(
+                embedded_input=embedded_input,
+                task_indices=task_indices,
+                context_len=current_context_len,
+                num_tasks=num_tasks,
+            )
+
         if style is not None:
             embedded_style = self.style_encoder(
                 batched_style
@@ -601,6 +638,10 @@ class TableTransformer(nn.Module):
             )
             current_context_len += 1  # Context length for attention now includes style
 
+        if summary_tokens is not None and summary_token_count > 0:
+            embedded_input = torch.cat((summary_tokens, embedded_input), dim=1)
+            current_context_len += summary_token_count
+
         if torch.isnan(embedded_input).any():
             raise ValueError(
                 f"There should be no NaNs in the encoded x and y."
@@ -627,9 +668,16 @@ class TableTransformer(nn.Module):
         test_encoder_out = encoder_out[
             :, current_context_len:, -1
         ]  # (batch, seq_test, embed_dim)
-        train_encoder_out = encoder_out[
+        train_encoder_out_full = encoder_out[
             :, :current_context_len, -1
         ]  # (batch, seq_train_and_style, embed_dim)
+
+        task_summary_embeddings = None
+        if summary_token_count > 0:
+            task_summary_embeddings = train_encoder_out_full[:, :summary_token_count]
+            train_encoder_out = train_encoder_out_full[:, summary_token_count:]
+        else:
+            train_encoder_out = train_encoder_out_full
 
         # No transposition needed here as _forward returns batch-first
 
@@ -641,8 +689,81 @@ class TableTransformer(nn.Module):
 
         output_decoded["train_embeddings"] = train_encoder_out
         output_decoded["test_embeddings"] = test_encoder_out  # Already batch-first
+        if task_summary_embeddings is not None:
+            output_decoded["task_summary_embeddings"] = task_summary_embeddings
 
         return output_decoded
+
+    def _build_task_summary_tokens(
+        self,
+        *,
+        embedded_input: torch.Tensor,
+        task_indices: torch.Tensor | None,
+        context_len: int,
+        num_tasks: int | None,
+    ) -> tuple[torch.Tensor | None, int]:
+        """Construct per-task summary tokens for hierarchical attention."""
+
+        if not self.use_hierarchical_attention or task_indices is None:
+            return None, 0
+
+        if context_len <= 0:
+            return None, 0
+
+        effective_context = min(context_len, task_indices.shape[1])
+        if effective_context <= 0:
+            return None, 0
+
+        task_slice = task_indices[:, :effective_context]
+        valid_mask = task_slice >= 0
+        if not bool(valid_mask.any()):
+            return None, 0
+
+        if num_tasks is None:
+            positive_ids = task_slice[valid_mask]
+            if positive_ids.numel() == 0:
+                return None, 0
+            num_tasks = int(positive_ids.max().item() + 1)
+
+        if num_tasks <= 0:
+            return None, 0
+
+        seq_embeddings = embedded_input[:, :effective_context]
+
+        one_hot = F.one_hot(
+            task_slice.clamp(min=0), num_classes=num_tasks
+        ).to(seq_embeddings.dtype)
+        one_hot = one_hot * valid_mask.unsqueeze(-1)
+
+        summary = torch.einsum("bste,bsq->bqte", seq_embeddings, one_hot)
+        counts = one_hot.sum(dim=1, keepdim=False).unsqueeze(-1).unsqueeze(-1)
+
+        summary = summary / counts.clamp_min(1.0)
+
+        if self.task_summary_proj is not None:
+            summary = self.task_summary_proj(summary)
+
+        valid_task_mask = counts.squeeze(-1).squeeze(-1) > 0
+        if not bool(valid_task_mask.any()):
+            return None, 0
+
+        if bool(valid_task_mask.all()):
+            return summary, summary.shape[1]
+
+        max_valid_tasks = int(valid_task_mask.sum(dim=1).max().item())
+        if max_valid_tasks <= 0:
+            return None, 0
+
+        batch_size, _, num_tokens, embed_dim = summary.shape
+        padded = summary.new_zeros((batch_size, max_valid_tasks, num_tokens, embed_dim))
+        for batch_index in range(batch_size):
+            mask = valid_task_mask[batch_index]
+            if not bool(mask.any()):
+                continue
+            selected = summary[batch_index, mask]
+            padded[batch_index, : selected.shape[0]] = selected
+
+        return padded, max_valid_tasks
 
     def add_embeddings(  # noqa: C901, PLR0912
         self,

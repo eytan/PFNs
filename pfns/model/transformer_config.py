@@ -29,6 +29,8 @@ class TransformerConfig(base_config.BaseConfig):
     features_per_group: int = 1
     attention_between_features: bool = True
     model_extra_args: tp.Dict[str, base_config.BaseTypes] | None = None
+    use_hierarchical_attention: bool = False
+    use_task_summary_projection: bool = True
 
     def create_model(self) -> transformer.TableTransformer:
         # Resolve criterion
@@ -81,6 +83,8 @@ class TransformerConfig(base_config.BaseConfig):
             style_encoder=style_encoder,
             y_style_encoder=y_style_encoder,
             batch_first=True,  # model is batch_first by default now
+            use_hierarchical_attention=self.use_hierarchical_attention,
+            use_task_summary_projection=self.use_task_summary_projection,
             **(self.model_extra_args or {}),
         )
         model.criterion = criterion

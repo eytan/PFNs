@@ -459,6 +459,11 @@ def train_or_evaluate_epoch(
             time_to_get_batch = time.time() - before_get_batch
             before_forward = time.time()
             try:
+                task_indices = (
+                    batch.task_indices.to(device)
+                    if batch.task_indices is not None
+                    else None
+                )
                 with autocast(device.split(":")[0], enabled=scaler is not None):
                     output = model(
                         x=batch.x.to(device),
@@ -467,6 +472,8 @@ def train_or_evaluate_epoch(
                         y_style=move_y_style_and_check_shape(
                             batch.y_style, batch.y, device
                         ),
+                        task_indices=task_indices,
+                        num_tasks=batch.num_tasks,
                         only_return_standard_out=True,
                     )  # shape: (batch_size, test_len)
 

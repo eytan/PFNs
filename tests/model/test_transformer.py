@@ -93,6 +93,75 @@ def test_transformer_forward(sample_data):
         )
 
 
+def test_transformer_hierarchical_attention(batch_first_setting):
+    batch_first = batch_first_setting
+    batch_size = 3
+    seq_len_train = 8
+    seq_len_test = 4
+    num_features = 5
+    num_tasks = 3
+
+    train_x_bf = torch.randn(batch_size, seq_len_train, num_features)
+    train_y_bf = torch.randn(batch_size, seq_len_train, 1)
+    test_x_bf = torch.randn(batch_size, seq_len_test, num_features)
+
+    task_indices_train = torch.randint(0, num_tasks, (batch_size, seq_len_train))
+    for task_id in range(num_tasks):
+        task_indices_train[:, task_id % seq_len_train] = task_id
+    task_indices_full = torch.cat(
+        (
+            task_indices_train,
+            -torch.ones(batch_size, seq_len_test, dtype=torch.long),
+        ),
+        dim=1,
+    )
+
+    if batch_first:
+        train_x = train_x_bf
+        train_y = train_y_bf
+        test_x = test_x_bf
+        task_indices = task_indices_full
+    else:
+        train_x = train_x_bf.transpose(0, 1)
+        train_y = train_y_bf.transpose(0, 1)
+        test_x = test_x_bf.transpose(0, 1)
+        task_indices = task_indices_full.transpose(0, 1)
+
+    model = TableTransformer(
+        ninp=32,
+        nhead=2,
+        nhid=64,
+        nlayers=2,
+        batch_first=batch_first,
+        use_hierarchical_attention=True,
+    )
+
+    outputs = model(
+        x=train_x,
+        y=train_y,
+        test_x=test_x,
+        task_indices=task_indices,
+        num_tasks=num_tasks,
+        only_return_standard_out=False,
+    )
+
+    standard = outputs["standard"]
+    if batch_first:
+        assert standard.shape == (batch_size, seq_len_test, 1)
+        train_embeddings = outputs["train_embeddings"]
+        assert train_embeddings.shape[1] == seq_len_train
+        summary = outputs["task_summary_embeddings"]
+        assert summary.shape[0] == batch_size
+        assert summary.shape[1] == num_tasks
+    else:
+        assert standard.shape == (seq_len_test, batch_size, 1)
+        train_embeddings = outputs["train_embeddings"]
+        assert train_embeddings.shape[0] == seq_len_train
+        summary = outputs["task_summary_embeddings"]
+        assert summary.shape[0] == num_tasks
+        assert summary.shape[1] == batch_size
+
+
 def test_add_embeddings_normal_rand_vec():
     """Test that add_embeddings adds the same embeddings when using normal_rand_vec."""
     # Create a transformer with normal_rand_vec feature positional embedding

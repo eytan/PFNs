@@ -17,6 +17,7 @@ class BatchShape:
     seq_len: int
     num_features: int
     single_eval_pos: Optional[int] = None
+    num_tasks: Optional[int] = None
 
     def as_get_batch_kwargs(self):
         return {
@@ -24,6 +25,7 @@ class BatchShape:
             "seq_len": self.seq_len,
             "num_features": self.num_features,
             "single_eval_pos": self.single_eval_pos,
+            "num_tasks": self.num_tasks,
         }
 
 
@@ -35,6 +37,8 @@ class BatchShapeSamplerConfig(BaseConfig):
     min_num_features: int = 1
     max_num_features: int = 16
     fixed_num_test_instances: Optional[int] = None
+    min_num_tasks: Optional[int] = None
+    max_num_tasks: Optional[int] = None
 
     seed: int = 42
 
@@ -62,9 +66,25 @@ class BatchShapeSamplerConfig(BaseConfig):
             seq_len = self.fixed_num_test_instances + single_eval_pos
 
         # future todo: adapt batch_size and num_features based on seq_len -> shrinking them for large seq_lens
+        if self.min_num_tasks is not None and self.max_num_tasks is not None:
+            if self.min_num_tasks <= 0 or self.max_num_tasks <= 0:
+                raise ValueError("Number of tasks must be positive when provided.")
+            if self.min_num_tasks > self.max_num_tasks:
+                raise ValueError(
+                    "min_num_tasks must be smaller or equal to max_num_tasks"
+                )
+            num_tasks = rng.randint(self.min_num_tasks, self.max_num_tasks)
+        elif self.min_num_tasks is None and self.max_num_tasks is None:
+            num_tasks = None
+        else:
+            raise ValueError(
+                "Either specify both min_num_tasks and max_num_tasks or none of them."
+            )
+
         return BatchShape(
             batch_size=self.batch_size,
             seq_len=seq_len,
             num_features=num_features,
             single_eval_pos=single_eval_pos,
+            num_tasks=num_tasks,
         )
