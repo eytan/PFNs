@@ -453,6 +453,22 @@ class MultiHeadAttention(torch.nn.Module):
             v = v_cache
             kv = kv_cache
 
+            # Handle batch size mismatch (broadcast KV caching with features_per_group)
+            # When context is encoded with batch=1 but query has batch=N (due to
+            # batch × num_features merging), we need to broadcast the cached KV
+            # Use expand (not repeat) to preserve gradient flow through shared memory
+            query_batch = x.shape[0]
+            if k is not None and k.shape[0] != query_batch:
+                num_repeats = query_batch // k.shape[0]
+                if query_batch == num_repeats * k.shape[0]:
+                    # Expand creates a view with repeated data (memory-efficient)
+                    k = k.repeat(num_repeats, *([1] * (k.dim() - 1)))
+                    v = v.repeat(num_repeats, *([1] * (v.dim() - 1)))
+            if kv is not None and kv.shape[0] != query_batch:
+                num_repeats = query_batch // kv.shape[0]
+                if query_batch == num_repeats * kv.shape[0]:
+                    kv = kv.repeat(num_repeats, *([1] * (kv.dim() - 1)))
+
         assert (k is None) == (v is None)
 
         if self._w_qkv is None:
@@ -641,16 +657,22 @@ class MultiHeadAttention(torch.nn.Module):
         if dont_look_at_yourself:
             assert positions_num_measures > 0
 
-        batch_size, seqlen_q, nhead, d_k = q.shape
-        _, seqlen_kv, nhead_kv, d_v = v.shape
+        batch_size_q, seqlen_q, nhead, d_k = q.shape
+        batch_size_kv, seqlen_kv, nhead_kv, d_v = v.shape
         share_kv_across_n_heads = nhead // nhead_kv
         if dropout_p is None:
             dropout_p = 0.0  # TODO: necessary?
+
+        # Detect broadcast case: KV has batch_size=1, Q has batch_size>1
+        # This happens when using cached KV from shared context for batched inference
+        is_broadcast_kv = batch_size_kv == 1 and batch_size_q > 1
+        batch_size = batch_size_q  # Always use Q's batch size for output
 
         use_flash_attention = (
             HAVE_FLASH_ATTN
             and torch.cuda.is_available()
             and q.dtype == k.dtype == v.dtype == torch.float16
+            and not is_broadcast_kv  # Flash attention requires matching batch sizes
         )
 
         # this string comparison is reliable, as it does not compare to a subversion
@@ -811,10 +833,12 @@ class MultiHeadAttention(torch.nn.Module):
                 assert (
                     positions.shape[0] == batch_size and positions.shape[1] == seqlen_q
                 ), f"positions (q) shape {positions.shape} incompatible with {(batch_size, seqlen_q)}"
+                # In broadcast mode, positions_kv has batch_size=1 matching KV cache
+                expected_pos_kv_batch = batch_size_kv if is_broadcast_kv else batch_size
                 assert (
-                    positions_kv.shape[0] == batch_size
+                    positions_kv.shape[0] == expected_pos_kv_batch
                     and positions_kv.shape[1] == seqlen_kv
-                ), f"positions_kv (kv) shape {positions_kv.shape} incompatible with {(batch_size, seqlen_kv)}"
+                ), f"positions_kv (kv) shape {positions_kv.shape} incompatible with {(expected_pos_kv_batch, seqlen_kv)}"
                 pos_q = positions
                 pos_k = positions_kv
                 # Distance per (q,k)

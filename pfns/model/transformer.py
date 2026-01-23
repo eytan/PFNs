@@ -233,6 +233,126 @@ class TableTransformer(nn.Module):
 
         self.x_only_mode = x_only_mode
 
+        # For broadcast KV caching: track if context has been encoded
+        self._context_encoded = False
+        self._cached_context_batch_size: int | None = None
+
+    def encode_context(
+        self,
+        x_train: torch.Tensor,
+        y_train: torch.Tensor,
+        style: torch.Tensor | None = None,
+        y_style: torch.Tensor | None = None,
+        **kwargs,
+    ) -> None:
+        """Pre-compute and cache KV for training context with batch_size=1.
+
+        This enables memory-efficient batched inference where the training
+        context is computed once and shared across multiple parallel evaluations
+        (e.g., for BoTorch's optimize_acqf with batch_limit > 1).
+
+        Args:
+            x_train: Training inputs. Shape: (n_train, n_features) or (1, n_train, n_features)
+            y_train: Training targets. Shape: (n_train,) or (n_train, 1) or (1, n_train) or (1, n_train, 1)
+            style: Optional style vector
+            y_style: Optional y style vector
+            **kwargs: Additional arguments passed to _forward
+        """
+        # Ensure batch dimension exists and is 1
+        # x_train: (n_train, n_features) → (1, n_train, n_features)
+        if x_train.dim() == 2:
+            x_train = x_train.unsqueeze(0)
+
+        # y_train: various shapes → (1, n_train, 1)
+        if y_train.dim() == 1:
+            # (n_train,) → (1, n_train, 1)
+            y_train = y_train.unsqueeze(0).unsqueeze(-1)
+        elif y_train.dim() == 2:
+            # Could be (n_train, 1) or (1, n_train)
+            if y_train.shape[0] == 1:
+                # (1, n_train) → (1, n_train, 1)
+                y_train = y_train.unsqueeze(-1)
+            else:
+                # (n_train, 1) → (1, n_train, 1)
+                y_train = y_train.unsqueeze(0)
+        # y_train.dim() == 3: already (batch, n_train, targets)
+
+        assert x_train.shape[0] == 1, f"encode_context requires batch_size=1, got {x_train.shape[0]}"
+        assert y_train.shape[0] == 1, f"encode_context requires batch_size=1 for y, got {y_train.shape[0]}"
+
+        # Enable caching
+        orig_cache_setting = self.cache_trainset_representation
+        self.cache_trainset_representation = True
+
+        # Run forward pass to populate KV cache
+        # single_eval_pos = y_train.shape[1] means all of y is training data
+        with torch.no_grad():
+            # We need a dummy test point to complete the forward pass
+            # Use first training point as dummy (output will be discarded)
+            dummy_test_x = x_train[:, :1, :]
+
+            # Handle batch_first
+            if self.batch_first:
+                x_full = torch.cat([x_train, dummy_test_x], dim=1)
+            else:
+                x_train_t = x_train.transpose(0, 1)
+                dummy_test_x_t = dummy_test_x.transpose(0, 1)
+                x_full = torch.cat([x_train_t, dummy_test_x_t], dim=0).transpose(0, 1)
+                # Actually keep it batch_first for internal processing
+                x_full = torch.cat([x_train, dummy_test_x], dim=1)
+
+            self._forward(
+                x_full,
+                y_train,
+                single_eval_pos=y_train.shape[1],
+                style=style,
+                y_style=y_style,
+                **kwargs,
+            )
+
+        self.cache_trainset_representation = orig_cache_setting
+        self._context_encoded = True
+        self._cached_context_batch_size = 1
+
+    @contextmanager
+    def shared_context(
+        self,
+        x_train: torch.Tensor,
+        y_train: torch.Tensor,
+        style: torch.Tensor | None = None,
+        y_style: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        """Context manager for memory-efficient batched evaluation using shared context cache.
+
+        Within this context, the training data KV cache is computed once with batch_size=1
+        and reused for all subsequent forward passes with arbitrary batch sizes.
+
+        Example:
+            with model.shared_context(X_train, Y_train):
+                for X_batch in candidate_batches:
+                    logits = model(x=None, y=None, test_x=X_batch)
+
+        Args:
+            x_train: Training inputs
+            y_train: Training targets
+            style: Optional style vector
+            y_style: Optional y style vector
+            **kwargs: Additional arguments passed to encode_context
+        """
+        orig_cache_setting = self.cache_trainset_representation
+        self.cache_trainset_representation = True
+
+        self.encode_context(x_train, y_train, style=style, y_style=y_style, **kwargs)
+
+        try:
+            yield self
+        finally:
+            self.empty_trainset_representation_cache()
+            self.cache_trainset_representation = orig_cache_setting
+            self._context_encoded = False
+            self._cached_context_batch_size = None
+
     def forward(
         self,
         x: torch.Tensor | None,

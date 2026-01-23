@@ -584,13 +584,29 @@ class VariableNumFeaturesEncoderStep(SeqEncStep):
                 dtype=x.dtype,
             )
         if self.normalize_by_used_features:
+            norm_factor = self.number_of_used_features_.to(x.device)
+
+            # Handle batch size mismatch (occurs with broadcast KV caching)
+            # When using cached context, the merged batch size (batch * num_features)
+            # may differ between encode_context and test inference
+            if norm_factor.shape[0] != x.shape[1]:
+                # With features_per_group=1, each sub-batch has 1 feature,
+                # so normalization factor should repeat for each original batch item
+                num_repeats = x.shape[1] // norm_factor.shape[0]
+                if x.shape[1] == num_repeats * norm_factor.shape[0]:
+                    # Broadcast by repeating the pattern
+                    norm_factor = norm_factor.repeat(num_repeats, 1)
+                else:
+                    # Fallback: use mean normalization factor
+                    norm_factor = norm_factor.mean().expand(x.shape[1], 1)
+
             if self.normalize_by_sqrt:
                 # Verified that this gives indeed unit variance with appended zeros
                 x = x * torch.sqrt(
-                    self.num_features / self.number_of_used_features_.to(x.device),
+                    self.num_features / norm_factor,
                 )
             else:
-                x = x * (self.num_features / self.number_of_used_features_.to(x.device))
+                x = x * (self.num_features / norm_factor)
 
         zeros_appended = torch.zeros(
             *x.shape[:-1],
