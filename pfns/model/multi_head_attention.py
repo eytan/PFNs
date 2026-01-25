@@ -453,6 +453,46 @@ class MultiHeadAttention(torch.nn.Module):
             v = v_cache
             kv = kv_cache
 
+            # Handle batch dimension broadcast when cached KV has different batch
+            # size than the query. This is common when caching training context
+            # with batch_size=1 and evaluating multiple test batches.
+            # The batch dimension includes feature groups, so we need to repeat
+            # (not just expand) when batch sizes differ.
+            query_batch_size = x.shape[0]
+            if k is not None and k.shape[0] != query_batch_size:
+                if k.shape[0] == 1:
+                    k = k.expand(query_batch_size, *k.shape[1:])
+                elif query_batch_size % k.shape[0] == 0:
+                    n_repeats = query_batch_size // k.shape[0]
+                    k = k.repeat(n_repeats, *([1] * (k.dim() - 1)))
+                else:
+                    raise RuntimeError(
+                        f"Cannot broadcast cached k with shape {k.shape} to query "
+                        f"batch size {query_batch_size}."
+                    )
+            if v is not None and v.shape[0] != query_batch_size:
+                if v.shape[0] == 1:
+                    v = v.expand(query_batch_size, *v.shape[1:])
+                elif query_batch_size % v.shape[0] == 0:
+                    n_repeats = query_batch_size // v.shape[0]
+                    v = v.repeat(n_repeats, *([1] * (v.dim() - 1)))
+                else:
+                    raise RuntimeError(
+                        f"Cannot broadcast cached v with shape {v.shape} to query "
+                        f"batch size {query_batch_size}."
+                    )
+            if kv is not None and kv.shape[0] != query_batch_size:
+                if kv.shape[0] == 1:
+                    kv = kv.expand(query_batch_size, *kv.shape[1:])
+                elif query_batch_size % kv.shape[0] == 0:
+                    n_repeats = query_batch_size // kv.shape[0]
+                    kv = kv.repeat(n_repeats, *([1] * (kv.dim() - 1)))
+                else:
+                    raise RuntimeError(
+                        f"Cannot broadcast cached kv with shape {kv.shape} to query "
+                        f"batch size {query_batch_size}."
+                    )
+
         assert (k is None) == (v is None)
 
         if self._w_qkv is None:
