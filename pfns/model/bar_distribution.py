@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Any, List, TYPE_CHECKING
 
 import torch
-
 from pfns import base_config
 from torch import nn
 from typing_extensions import override
@@ -38,9 +37,21 @@ class BarDistributionConfig(base_config.BaseConfig):
         else:
             return BarDistribution(**kwargs)
 
+    @classmethod
+    def _loading_kwarg_transform(cls, kwargs):
+        if kwargs.pop("sobolev_multiplier", None) is not None:
+            print("WARNING: sobolev_multiplier is not running no more.")
+        return kwargs
+
 
 class BarDistribution(nn.Module):
-    def __init__(self, borders: torch.Tensor, *, ignore_nan_targets: bool = True):
+    def __init__(
+        self,
+        borders: torch.Tensor,
+        *,
+        ignore_nan_targets: bool = True,
+        probabilities: torch.Tensor | None = None,
+    ):
         """Loss for a distribution over bars. The bars are defined by the borders.
         The loss is the negative log density of the distribution. The density is defined
         as a softmax over the logits, where the softmax is scaled by the width of the
@@ -59,6 +70,7 @@ class BarDistribution(nn.Module):
         assert len(borders.shape) == 1
         borders = borders.contiguous()
         self.register_buffer("borders", borders)
+        self.probabilities = probabilities
         full_width = self.bucket_widths.sum()
 
         assert (1 - (full_width / (self.borders[-1] - self.borders[0]))).abs() < 1e-2, (
@@ -223,14 +235,13 @@ class BarDistribution(nn.Module):
         """Returns the negative log density (the _loss_).
 
         Args:
-            logits: The logits of the model.
-            y: The ys to compute the loss for.
+            logits: The logits of the model, shape (*batch_shape, num_bars)
+            y: The ys to compute the loss for, shape (*batch_shape,)
 
         Returns:
             The negative log density.
         """
         # gives the negative log density (the _loss_),
-        # y: T x B, logits: T x B x self.num_bars
         y = y.clone().view(*logits.shape[:-1])  # no trailing one dimension
         ignore_loss_mask = self.ignore_init(y)
         target_sample = self.map_to_bucket_idx(y)
@@ -244,7 +255,6 @@ class BarDistribution(nn.Module):
 
         scaled_bucket_log_probs = self.compute_scaled_log_probs(logits)
 
-        # T x B
         nll_loss = -scaled_bucket_log_probs.gather(
             -1,
             target_sample[..., None],
@@ -266,27 +276,30 @@ class BarDistribution(nn.Module):
         return p @ bucket_means
 
     def median(self, logits: torch.Tensor) -> torch.Tensor:
-        return self.icdf(logits, 0.5)
+        return self.icdf(logits=logits, left_prob=0.5)
 
-    def icdf(self, logits: torch.Tensor, left_prob: float) -> torch.Tensor:
+    def icdf(self, left_prob: float, logits: torch.Tensor | None) -> torch.Tensor:
         """Implementation of the quantile function
         :param logits: Tensor of any shape, with the last dimension being logits
         :param left_prob: float: The probability mass to the left of the result.
         :return: Position with `left_prob` probability weight to the left.
         """
-        probs = logits.softmax(-1)
+        if logits is None and self.probabilities is not None:
+            probs = self.probabilities
+        else:
+            probs = logits.softmax(-1)
         cumprobs = torch.cumsum(probs, -1)
         idx = (
             torch.searchsorted(
                 cumprobs,
-                left_prob * torch.ones(*cumprobs.shape[:-1], 1, device=logits.device),
+                left_prob * torch.ones(*cumprobs.shape[:-1], 1, device=probs.device),
             )
             .squeeze(-1)
             .clamp(0, cumprobs.shape[-1] - 1)
         )  # this might not do the right for outliers
         cumprobs = torch.cat(
             [
-                torch.zeros(*cumprobs.shape[:-1], 1, device=logits.device),
+                torch.zeros(*cumprobs.shape[:-1], 1, device=probs.device),
                 cumprobs,
             ],
             -1,
@@ -300,6 +313,19 @@ class BarDistribution(nn.Module):
             idx[..., None],
         ).squeeze(-1)
 
+    def sample(self, logits: torch.Tensor, t: float = 1.0) -> torch.Tensor:
+        """Samples values from the distribution.
+
+        Temperature t.
+        """
+        p_cdf = torch.rand(*logits.shape[:-1])
+        return torch.tensor(
+            [
+                self.icdf(logits=logits[i, :] / t, left_prob=p)
+                for i, p in enumerate(p_cdf.tolist())
+            ],
+        )
+
     def quantile(
         self,
         logits: torch.Tensor,
@@ -308,8 +334,8 @@ class BarDistribution(nn.Module):
         side_probs = (1.0 - center_prob) / 2
         return torch.stack(
             (
-                self.icdf(logits, side_probs),
-                self.icdf(logits, 1.0 - side_probs),
+                self.icdf(logits=logits, left_prob=side_probs),
+                self.icdf(logits=logits, left_prob=1.0 - side_probs),
             ),
             -1,
         )
@@ -344,7 +370,7 @@ class BarDistribution(nn.Module):
         """
         if maximize:
             rest_prob = 1 - rest_prob
-        return self.icdf(logits, rest_prob)
+        return self.icdf(logits=logits, left_prob=rest_prob)
 
     def mode(self, logits: torch.Tensor) -> torch.Tensor:
         density = logits.softmax(-1) / self.bucket_widths
@@ -586,16 +612,6 @@ class FullSupportBarDistribution(BarDistribution):
         """Probability density function at y."""
         return torch.exp(self.forward(logits, y))
 
-    def sample(self, logits: torch.Tensor, t: float = 1.0) -> torch.Tensor:
-        """Samples values from the distribution.
-
-        Temperature t.
-        """
-        p_cdf = torch.rand(*logits.shape[:-1])
-        return torch.tensor(
-            [self.icdf(logits[i, :] / t, p) for i, p in enumerate(p_cdf.tolist())],
-        )
-
     @override
     def mean(self, logits: torch.Tensor) -> torch.Tensor:
         bucket_means = self.borders[:-1] + self.bucket_widths / 2
@@ -834,6 +850,8 @@ def get_bucket_borders(
     if ys is not None:
         ys = ys.flatten()
         ys = ys[~torch.isnan(ys)]
+        ys = ys.sort()[0]
+        ys = torch.unique_consecutive(ys)
         assert (
             len(ys) > num_outputs
         ), f"Number of ys :{len(ys)} must be larger than num_outputs: {num_outputs}"
@@ -869,9 +887,9 @@ def get_bucket_borders(
             0,
         )
 
-    assert len(borders) - 1 == num_outputs, (
-        f"len(borders) - 1 == {len(borders) - 1}" f" != {num_outputs} == num_outputs"
-    )
+    assert (
+        len(borders) - 1 == num_outputs
+    ), f"len(borders) - 1 == {len(borders) - 1} != {num_outputs} == num_outputs"
 
     if not widen_borders_factor or widen_borders_factor == 1.0:
         assert (
@@ -881,9 +899,4 @@ def get_bucket_borders(
             full_range[-1] == borders[-1]  # type: ignore
         ), f"{full_range[-1]} != {borders[-1]}"  # type: ignore
 
-    unique_borders = torch.unique_consecutive(borders)
-
-    if (unique_borders != borders).any():
-        print("Borders were not unique, removed duplicates.")
-
-    return unique_borders
+    return borders

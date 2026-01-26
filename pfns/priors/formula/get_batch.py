@@ -2,11 +2,9 @@ import random
 from typing import Literal
 
 import numpy as np
-
 import torch
 
 from .. import Batch
-
 from .ops import binary_ops, unary_ops
 from .trees import evaluate_tree, sample_tree
 
@@ -80,6 +78,8 @@ def get_batch(
     n_targets_per_input=1,
     single_eval_pos=None,  # not using this
     device="cpu",  # ignoring this
+    return_trees=False,
+    batch_size_per_gp_sample=None,
 ):
     assert (
         n_targets_per_input == 1
@@ -105,6 +105,9 @@ def get_batch(
     )
 
     # longterm todo: add styles based on the tree
+
+    if return_trees:
+        return batch, [tree for _, _, tree in batch_as_list]
 
     return batch
 

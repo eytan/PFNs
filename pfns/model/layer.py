@@ -50,6 +50,10 @@ class PerFeatureLayer(Module):
         d_k: int | None = None,
         d_v: int | None = None,
         precomputed_kv: None | torch.Tensor | tuple[torch.Tensor, torch.Tensor] = None,
+        attention_across_items_first: bool = False,
+        positions_num_measures: int = 0,
+        positions_base: float = 0.02,
+        dont_look_at_yourself: bool = False,
     ) -> None:
         """
         Args:
@@ -132,7 +136,11 @@ class PerFeatureLayer(Module):
             precomputed_v=precomputed_v,
             precomputed_kv=precomputed_kv,
             init_gain=attention_init_gain,
+            positions_base=positions_base,
+            positions_num_measures=positions_num_measures,
+            dont_look_at_yourself=dont_look_at_yourself,
         )
+        self.positions_num_measures = positions_num_measures
 
         if dim_feedforward is None:
             dim_feedforward = 2 * d_model
@@ -179,6 +187,7 @@ class PerFeatureLayer(Module):
         self.multiquery_item_attention_for_test_set = (
             multiquery_item_attention_for_test_set
         )
+        self.attention_across_items_first = attention_across_items_first
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         state.setdefault("save_peak_mem_factor", None)
@@ -191,6 +200,9 @@ class PerFeatureLayer(Module):
         *,
         cache_trainset_representation: bool = False,
         att_src: Tensor | None = None,
+        rope_vals: torch.Tensor | None = None,
+        positions: torch.Tensor
+        | None = None,  # shape: [batch, seqlen_q, num_feature_blocks, 1]
     ) -> Tensor:
         """Pass the input through the encoder layer.
 
@@ -254,9 +266,15 @@ class PerFeatureLayer(Module):
             )
 
         def attn_between_items(x: torch.Tensor) -> torch.Tensor:
+            transposed_rope_vals = (
+                rope_vals.transpose(1, 2) if rope_vals is not None else None
+            )
             # we need to transpose as self attention always treats
             # dim -2 as the sequence dimension
             if self.multiquery_item_attention_for_test_set:
+                assert rope_vals is None
+                assert self.positions_num_measures == 0
+
                 if single_eval_pos < x.shape[1]:
                     new_x_test = self.self_attn_between_items(
                         x[:, single_eval_pos:].transpose(1, 2),
@@ -295,10 +313,15 @@ class PerFeatureLayer(Module):
                 )
 
             attention_src_x = None
+            positions_kv = None
             if att_src is not None:
                 attention_src_x = att_src.transpose(1, 2)
             elif single_eval_pos:
                 attention_src_x = x[:, :single_eval_pos].transpose(1, 2)
+                if positions is not None:
+                    positions_kv = positions[:, :single_eval_pos].transpose(1, 2)
+            else:
+                assert positions is None
 
             return self.self_attn_between_items(
                 x.transpose(1, 2),
@@ -308,6 +331,9 @@ class PerFeatureLayer(Module):
                 add_input=True,
                 allow_inplace=True,
                 use_cached_kv=cache_trainset_representation and not single_eval_pos,
+                rope_vals=transposed_rope_vals,
+                positions=positions.transpose(1, 2) if positions is not None else None,
+                positions_kv=positions_kv,
             ).transpose(1, 2)
 
         # the mlp tends to require 8 times more memory at its peak, that is why we use 8 here
@@ -325,8 +351,12 @@ class PerFeatureLayer(Module):
                 " blocks must be 1."
             )
 
+        if self.attention_across_items_first:
+            sublayers.insert(0, attn_between_items)
+        else:
+            sublayers.append(attn_between_items)
+
         sublayers += [
-            attn_between_items,
             partial(
                 self.mlp.__call__,
                 save_peak_mem_factor=(

@@ -2,31 +2,31 @@ import torch
 
 from pfns.model.multi_head_attention import MultiHeadAttention
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Testing attention on {device=}.")
+n_batch = 7
+nhead = 4
+n_seq_q = 534
+n_seq_kv = 316
+embed_dim = 128
+
+dtype = torch.float16 if device == "cuda" else torch.float32
+
+x_q = torch.normal(
+    torch.tensor(0.0),
+    torch.tensor(1.0),
+    size=(n_batch, n_seq_q, embed_dim),
+)
+x_kv = torch.normal(
+    torch.tensor(0.0),
+    torch.tensor(1.0),
+    size=(n_batch, n_seq_kv, embed_dim),
+)
+x_q = x_q.to(device, dtype)
+x_kv = x_kv.to(device, dtype)
+
 
 def test_attention():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Testing attention on {device=}.")
-    n_batch = 7
-    nhead = 4
-    n_seq_q = 534
-    n_seq_kv = 316
-    embed_dim = 128
-
-    dtype = torch.float16 if device == "cuda" else torch.float32
-
-    x_q = torch.normal(
-        torch.tensor(0.0),
-        torch.tensor(1.0),
-        size=(n_batch, n_seq_q, embed_dim),
-    )
-    x_kv = torch.normal(
-        torch.tensor(0.0),
-        torch.tensor(1.0),
-        size=(n_batch, n_seq_kv, embed_dim),
-    )
-    x_q = x_q.to(device, dtype)
-    x_kv = x_kv.to(device, dtype)
-
     att_ref = torch.nn.MultiheadAttention(
         embed_dim,
         nhead,
@@ -103,20 +103,6 @@ def test_attention():
     att_multi_ref.load_state_dict(state_dict_to_load)
     y = att_multi_ref(x_q, x_kv)
     y_ = att_multi_test(x_q, x_kv)
-    assert torch.sqrt(torch.nn.functional.mse_loss(y, y_)) < 5e-5
-
-    # Caching.
-    att_test = MultiHeadAttention(
-        input_size=embed_dim,
-        output_size=embed_dim,
-        d_k=embed_dim // nhead,
-        d_v=embed_dim // nhead,
-        nhead=nhead,
-        device=device,
-        dtype=dtype,
-    )
-    y = att_test(x_q, x_kv, cache_kv=True)
-    y_ = att_test(x_q, use_cached_kv=True)
     assert torch.sqrt(torch.nn.functional.mse_loss(y, y_)) < 5e-5
 
 

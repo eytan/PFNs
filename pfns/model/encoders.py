@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
 from typing import Any
 
 import numpy as np
 import torch
-
 from pfns import base_config
 from pfns.model import encoders
 from pfns.priors.hyperparameter_sampling import (
@@ -121,6 +119,26 @@ class EncoderConfig(base_config.BaseConfig):
 ### Style Encoders
 
 
+class ConstantStyleNormalization(nn.Module):
+    def __init__(self, mean, std):
+        super().__init__()
+        self.mean = mean
+        self.std = std
+
+    def forward(self, x):
+        return (x - self.mean) / self.std
+
+
+class NanHandlingStyleEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        nan_indicators = torch.isnan(x).float() * 2.0 - 1
+        x = torch.nan_to_num(x, nan=0.0)
+        return torch.cat([x, nan_indicators], dim=-1)
+
+
 def linear_style_encoder(num_styles, emsize):
     return nn.Linear(num_styles, emsize)
 
@@ -132,6 +150,16 @@ class StyleEncoderConfig(base_config.BaseConfig):
         dict[str, base_config.BaseTypes | DistributionConfig] | None
     ) = None
     encoder_type: str = "linear"
+    constant_normalization_mean: float = 0.0
+    constant_normalization_std: float = 1.0
+    nan_handling: bool | None = None
+
+    def __post_init__(self):
+        if self.normalize_to_hyperparameters is not None:
+            assert self.constant_normalization_mean == 0.0
+            assert self.constant_normalization_std == 1.0
+            assert self.nan_handling is None
+            assert self.num_styles is None
 
     def create_encoder(self, emsize):
         num_features = self.num_styles
@@ -145,9 +173,21 @@ class StyleEncoderConfig(base_config.BaseConfig):
             hpn = HyperparameterNormalizer(self.normalize_to_hyperparameters)
             num_features = hpn.num_hps * 2
             modules.append(hpn)
+        else:
+            assert self.num_styles is not None
+            normalizer = ConstantStyleNormalization(
+                mean=self.constant_normalization_mean,
+                std=self.constant_normalization_std,
+            )
+            modules.append(normalizer)
+
+            if self.nan_handling:
+                modules.append(NanHandlingStyleEncoder())
+                num_features *= 2
 
         if self.encoder_type == "linear":
             modules.append(encoders.linear_style_encoder(num_features, emsize))
+            modules.append(nn.Flatten())
             return nn.Sequential(*modules)
         else:
             raise ValueError(
@@ -206,6 +246,63 @@ class SequentialEncoder(nn.Sequential):
 
         return input[self.output_key] if self.output_key is not None else input
 
+    def freeze_fitted_state(self) -> None:
+        """Freeze all encoder steps to prevent _fit() from being called.
+
+        When frozen, encoder steps will reuse their existing fitted state
+        instead of refitting on new data. This is used during cached inference
+        to prevent correlation estimation from corrupting the encoder state.
+        """
+        for module in self:
+            if hasattr(module, "_fitted_state_frozen"):
+                module._fitted_state_frozen = True
+
+    def unfreeze_fitted_state(self) -> None:
+        """Unfreeze all encoder steps to allow _fit() to be called.
+
+        This restores normal behavior where encoder steps fit on training data.
+        """
+        for module in self:
+            if hasattr(module, "_fitted_state_frozen"):
+                module._fitted_state_frozen = False
+
+    def save_fitted_state(self) -> dict:
+        """Save the fitted state of all encoder steps.
+
+        Returns a dictionary mapping module indices to their fitted state.
+        This can be restored later with `restore_fitted_state`.
+        """
+        saved_state = {}
+        for idx, module in enumerate(self):
+            module_state = {}
+            # Save any attribute that starts with underscore and ends with underscore
+            # (fitted state convention: _attribute_)
+            for attr_name in dir(module):
+                if (
+                    attr_name.endswith("_")
+                    and not attr_name.startswith("__")
+                    and not callable(getattr(module, attr_name, None))
+                ):
+                    attr_value = getattr(module, attr_name, None)
+                    if isinstance(attr_value, torch.Tensor):
+                        module_state[attr_name] = attr_value.clone()
+                    elif attr_value is not None:
+                        module_state[attr_name] = attr_value
+            if module_state:
+                saved_state[idx] = module_state
+        return saved_state
+
+    def restore_fitted_state(self, saved_state: dict) -> None:
+        """Restore the fitted state of all encoder steps.
+
+        Args:
+            saved_state: Dictionary returned by `save_fitted_state`.
+        """
+        for idx, module_state in saved_state.items():
+            module = self[idx]
+            for attr_name, attr_value in module_state.items():
+                setattr(module, attr_name, attr_value)
+
 
 class SeqEncStep(nn.Module):
     """Abstract base class for sequential encoder steps.
@@ -235,6 +332,10 @@ class SeqEncStep(nn.Module):
         super().__init__()
         self.in_keys = in_keys
         self.out_keys = out_keys
+        # When frozen, _fit() is skipped and the existing fitted state is used.
+        # This is used during cached inference to prevent correlation estimation
+        # from corrupting the encoder state.
+        self._fitted_state_frozen = False
 
     # Either implement _forward:
 
@@ -307,7 +408,14 @@ class SeqEncStep(nn.Module):
         """
         args = [state[in_key] for in_key in self.in_keys]
         if hasattr(self, "_fit"):
-            if kwargs["single_eval_pos"] or not cache_trainset_representation:
+            # Skip _fit if:
+            # 1. State is frozen (during cached inference to prevent corruption)
+            # 2. OR cache is enabled and we're in inference mode (no training data)
+            should_fit = (
+                not self._fitted_state_frozen
+                and (kwargs["single_eval_pos"] or not cache_trainset_representation)
+            )
+            if should_fit:
                 self._fit(*args, **kwargs)
             out = self._transform(*args, **kwargs)
         else:
@@ -444,11 +552,21 @@ class NanHandlingEncoderStep(SeqEncStep):
         """Compute the feature means on the training set for replacing NaNs.
 
         Args:
-            x: The input tensor.
+            x: The input tensor of shape (seq_len, batch_size, num_features).
             single_eval_pos: The position to use for single evaluation.
             **kwargs: Additional keyword arguments (unused).
         """
-        self.feature_means_ = torch_nanmean(x[:single_eval_pos], axis=0)
+        train_data = x[:single_eval_pos]  # (train_len, batch, num_features)
+        # Compute mean across sequence dimension (axis=0) → (batch, num_features)
+        seq_mean = torch_nanmean(train_data, axis=0)
+        # Average across batch dimension to get batch-independent means → (num_features,)
+        # This enables caching to work with different batch sizes between
+        # cache population and cache usage
+        if seq_mean.dim() > 1:
+            self.feature_means_ = torch_nanmean(seq_mean, axis=0)
+        else:
+            # Already 1D (single batch element case)
+            self.feature_means_ = seq_mean
 
     def _transform(
         self,
@@ -478,7 +596,9 @@ class NanHandlingEncoderStep(SeqEncStep):
         nan_mask = torch.logical_or(torch.isnan(x), torch.isinf(x))
         # replace nans with the mean of the corresponding feature
         x = x.clone()  # clone to avoid inplace operations
-        x[nan_mask] = self.feature_means_.unsqueeze(0).expand_as(x)[nan_mask]
+        # feature_means_ is (num_features,), reshape to broadcast with x (seq, batch, features)
+        means_expanded = self.feature_means_.view(1, 1, -1).expand_as(x)
+        x[nan_mask] = means_expanded[nan_mask]
 
         return x, nans_indicator
 
@@ -516,12 +636,18 @@ class VariableNumFeaturesEncoderStep(SeqEncStep):
         """Compute the number of used features on the training set.
 
         Args:
-            x: The input tensor.
+            x: The input tensor of shape (seq_len, batch_size, num_features).
             **kwargs: Additional keyword arguments (unused).
         """
+        # sel: (batch, num_features) - True where feature varies across sequence
         sel = (x[1:] == x[0]).sum(0) != (x.shape[0] - 1)
+        # per_batch_used: (batch,) - count of used features per batch element
+        per_batch_used = sel.sum(-1)
+        # Average across batch to get batch-independent count → scalar
+        # This enables caching to work with different batch sizes
+        avg_used = per_batch_used.float().mean()
         self.number_of_used_features_ = torch.clip(
-            sel.sum(-1).unsqueeze(-1),
+            avg_used.unsqueeze(-1),  # (1,) for broadcasting
             min=1,
         ).cpu()
 
@@ -544,13 +670,14 @@ class VariableNumFeaturesEncoderStep(SeqEncStep):
                 dtype=x.dtype,
             )
         if self.normalize_by_used_features:
+            # number_of_used_features_ is a scalar (1,) that broadcasts to any batch
+            n_used = self.number_of_used_features_.to(x.device)
+
             if self.normalize_by_sqrt:
                 # Verified that this gives indeed unit variance with appended zeros
-                x = x * torch.sqrt(
-                    self.num_features / self.number_of_used_features_.to(x.device),
-                )
+                x = x * torch.sqrt(self.num_features / n_used)
             else:
-                x = x * (self.num_features / self.number_of_used_features_.to(x.device))
+                x = x * (self.num_features / n_used)
 
         zeros_appended = torch.zeros(
             *x.shape[:-1],

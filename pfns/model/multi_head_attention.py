@@ -21,6 +21,26 @@ except ImportError:
     HAVE_FLASH_ATTN = False
 
 
+def apply_rope(x, rope_vals):
+    # x has shape [b,s,h,d]
+    # rope_vals has shape [b,s,d]
+    b, s, h, dim = x.shape
+    assert rope_vals.shape == (b, s, dim), f"{rope_vals.shape=} != {(b, s, dim)}"
+    assert (dim // 2) * 2 == dim, f"{dim} is not even"
+
+    x = x.reshape(b, s, h, -1, 2)
+    rope_vals = rope_vals.reshape(b, s, 1, -1, 2)
+
+    out = torch.stack(
+        [
+            x[..., 0] * rope_vals[..., 0] - x[..., 1] * rope_vals[..., 1],
+            x[..., 1] * rope_vals[..., 0] + x[..., 0] * rope_vals[..., 1],
+        ],
+        -1,
+    ).view(b, s, h, dim)
+    return out
+
+
 class MultiHeadAttention(torch.nn.Module):
     """
     An implementation of multi-head attention, heavily relying on the pytorch
@@ -186,6 +206,9 @@ class MultiHeadAttention(torch.nn.Module):
         precomputed_kv: torch.Tensor | None = None,
         recompute: bool = False,
         init_gain: float = 1.0,
+        positions_base: float = 0.02,
+        positions_num_measures: int = 0,
+        dont_look_at_yourself: bool = False,
     ):
         super().__init__()
         assert nhead % share_kv_across_n_heads == 0
@@ -201,6 +224,14 @@ class MultiHeadAttention(torch.nn.Module):
         self.softmax_scale = softmax_scale
         self.recompute = recompute
         self.init_gain = init_gain
+
+        self.positions_base = positions_base
+        assert (positions_num_measures + 1) <= self._d_k == self._d_v, (
+            f"positions_num_measures {positions_num_measures} must be less than "
+            f"or equal to d_k {self._d_k} and d_v {self._d_v}."
+        )
+        self.positions_num_measures = positions_num_measures
+        self.dont_look_at_yourself = dont_look_at_yourself
 
         w_out = torch.nn.Parameter(
             torch.empty(nhead, d_v, output_size, device=device, dtype=dtype),
@@ -287,6 +318,9 @@ class MultiHeadAttention(torch.nn.Module):
         reuse_first_head_kv: bool = False,
         only_cache_first_head_kv: bool = False,
         use_cached_kv: bool = False,
+        rope_vals: torch.Tensor | None = None,  # shape: [..., batch, seq_len, head dim]
+        positions: torch.Tensor | None = None,  # shape: [..., batch, seqlen_q, 1]
+        positions_kv: torch.Tensor | None = None,  # shape: [..., batch, seqlen_kv, 1]
     ):
         """X is the current hidden and has a shape of [batch, ..., seq_len, input_size].
         If keys and values are present in the cache and 'freeze_kv' is not set, they
@@ -299,10 +333,32 @@ class MultiHeadAttention(torch.nn.Module):
         assert not (
             cache_kv and use_cached_kv
         ), "Cannot cache and use cached keys and values at the same time."
-        assert not x.requires_grad or (
-            not self.has_cached_kv and not cache_kv
-        ), "Saving keys and values is only supported during inference."
+        assert (
+            not x.requires_grad or not cache_kv
+        ), "Saving keys and values will stop gradients to flow into trainset."
+        assert not (use_cached_kv and rope_vals is not None), (
+            "Cannot use rope_vals with cached KV - ROPE is already applied to cached values"
+        )
+
+        # Flatten the batch dimensions
         x, x_kv, x_shape_after_transpose = self._rearrange_inputs_to_flat_batch(x, x_kv)
+        if rope_vals is not None:
+            rope_vals = rope_vals.reshape(-1, *rope_vals.shape[-2:])
+
+        # flatten positions' batch dims, just like x and x_kv are flattened
+        positions_flat = None
+        positions_kv_flat = None
+        if positions is not None:
+            assert (
+                positions.shape[-1] == 1
+            ), f"positions must have trailing dim 1, got {positions.shape}"
+            # Squeeze the trailing dim and flatten batch dims
+            positions_flat = positions.reshape(-1, positions.shape[-2])
+        if positions_kv is not None:
+            assert (
+                positions_kv.shape[-1] == 1
+            ), f"positions_kv must have trailing dim 1, got {positions_kv.shape}"
+            positions_kv_flat = positions_kv.reshape(-1, positions_kv.shape[-2])
 
         nhead_kv = 1 if reuse_first_head_kv else self._nhead_kv
 
@@ -315,7 +371,6 @@ class MultiHeadAttention(torch.nn.Module):
             else:
                 batch_size, seqlen_kv = x.shape[:2]
 
-            # TODO: handling of device and dtype.
             if self._w_kv is not None or self._w_qkv is not None:
                 self._kv_cache = torch.empty(
                     batch_size,
@@ -356,6 +411,9 @@ class MultiHeadAttention(torch.nn.Module):
             allow_inplace=allow_inplace,
             save_peak_mem_factor=save_peak_mem_factor,
             reuse_first_head_kv=reuse_first_head_kv,
+            rope_vals=rope_vals,
+            positions=positions_flat,
+            positions_kv=positions_kv_flat,
         )
         return output.reshape(x_shape_after_transpose[:-1] + output.shape[-1:])
 
@@ -396,6 +454,46 @@ class MultiHeadAttention(torch.nn.Module):
             k = k_cache
             v = v_cache
             kv = kv_cache
+
+            # Handle batch dimension broadcast when cached KV has different batch
+            # size than the query. This is common when caching training context
+            # with batch_size=1 and evaluating multiple test batches.
+            # The batch dimension includes feature groups, so we need to repeat
+            # (not just expand) when batch sizes differ.
+            query_batch_size = x.shape[0]
+            if k is not None and k.shape[0] != query_batch_size:
+                if k.shape[0] == 1:
+                    k = k.expand(query_batch_size, *k.shape[1:])
+                elif query_batch_size % k.shape[0] == 0:
+                    n_repeats = query_batch_size // k.shape[0]
+                    k = k.repeat(n_repeats, *([1] * (k.dim() - 1)))
+                else:
+                    raise RuntimeError(
+                        f"Cannot broadcast cached k with shape {k.shape} to query "
+                        f"batch size {query_batch_size}."
+                    )
+            if v is not None and v.shape[0] != query_batch_size:
+                if v.shape[0] == 1:
+                    v = v.expand(query_batch_size, *v.shape[1:])
+                elif query_batch_size % v.shape[0] == 0:
+                    n_repeats = query_batch_size // v.shape[0]
+                    v = v.repeat(n_repeats, *([1] * (v.dim() - 1)))
+                else:
+                    raise RuntimeError(
+                        f"Cannot broadcast cached v with shape {v.shape} to query "
+                        f"batch size {query_batch_size}."
+                    )
+            if kv is not None and kv.shape[0] != query_batch_size:
+                if kv.shape[0] == 1:
+                    kv = kv.expand(query_batch_size, *kv.shape[1:])
+                elif query_batch_size % kv.shape[0] == 0:
+                    n_repeats = query_batch_size // kv.shape[0]
+                    kv = kv.repeat(n_repeats, *([1] * (kv.dim() - 1)))
+                else:
+                    raise RuntimeError(
+                        f"Cannot broadcast cached kv with shape {kv.shape} to query "
+                        f"batch size {query_batch_size}."
+                    )
 
         assert (k is None) == (v is None)
 
@@ -469,6 +567,9 @@ class MultiHeadAttention(torch.nn.Module):
         cache_kv: bool,
         use_cached_kv: bool,
         reuse_first_head_kv: bool,
+        rope_vals: torch.Tensor | None = None,  # shape: [batch, seq_len, head dim]
+        positions: torch.Tensor | None = None,  # shape: [batch, seqlen_q]
+        positions_kv: torch.Tensor | None = None,  # shape: [batch, seqlen_kv]
     ) -> torch.Tensor:
         """Attention computation.
         Called by 'forward', potentially on shards, once shapes have been normalized.
@@ -483,7 +584,21 @@ class MultiHeadAttention(torch.nn.Module):
             use_cached_kv=use_cached_kv,
             reuse_first_head_kv=reuse_first_head_kv,
         )
-        attention_head_outputs = MultiHeadAttention.compute_attention_heads(
+
+        if rope_vals is not None:
+            if q is not None:
+                q = apply_rope(q, rope_vals)
+            if k is not None:
+                k = apply_rope(k, rope_vals[:, : k.shape[1]])
+            if kv is not None:
+                kv[..., 0, :, :] = apply_rope(
+                    kv[..., 0, :, :], rope_vals[:, : kv.shape[1]]
+                )
+            if qkv is not None:
+                qkv[..., 0, :, :] = apply_rope(qkv[..., 0, :, :], rope_vals)
+                qkv[..., 1, :, :] = apply_rope(qkv[..., 1, :, :], rope_vals)
+
+        attention_head_outputs = self.compute_attention_heads(
             q,
             k,
             v,
@@ -491,6 +606,11 @@ class MultiHeadAttention(torch.nn.Module):
             qkv,
             self.dropout_p,
             self.softmax_scale,
+            positions=positions,
+            positions_kv=positions_kv,
+            positions_base=self.positions_base,
+            positions_num_measures=self.positions_num_measures,
+            dont_look_at_yourself=self.dont_look_at_yourself,
         )
         return torch.einsum(
             "... h d, h d s -> ... s",
@@ -524,7 +644,7 @@ class MultiHeadAttention(torch.nn.Module):
             share_kv_across_n_heads,
             -1,
         )
-        return kv.reshape(*kv.shape[:-3], nhead * share_kv_across_n_heads, d)
+        return kv.contiguous().reshape(*kv.shape[:-3], nhead * share_kv_across_n_heads, d)
 
     @staticmethod
     def compute_attention_heads(  # noqa: C901, PLR0912
@@ -535,6 +655,12 @@ class MultiHeadAttention(torch.nn.Module):
         qkv: torch.Tensor | None,
         dropout_p: float | None = None,
         softmax_scale: float | None = None,
+        *,
+        positions: torch.Tensor | None = None,  # shape: [batch, seqlen_q]
+        positions_kv: torch.Tensor | None = None,  # shape: [batch, seqlen_kv]
+        positions_base: float = 0.02,
+        positions_num_measures: int = 8,
+        dont_look_at_yourself: bool = False,  # only with positions is not None
     ) -> torch.Tensor:
         assert (k is None) == (v is None)
         assert sum([qkv is None, kv is None, k is None and v is None]) == 2
@@ -548,6 +674,14 @@ class MultiHeadAttention(torch.nn.Module):
         assert q is not None
         assert k is not None
         assert v is not None
+
+        if positions is not None:
+            assert (
+                positions_kv is not None
+            ), "positions is not None but positions_kv is None"
+
+        if dont_look_at_yourself:
+            assert positions_num_measures > 0
 
         batch_size, seqlen_q, nhead, d_k = q.shape
         _, seqlen_kv, nhead_kv, d_v = v.shape
@@ -565,6 +699,10 @@ class MultiHeadAttention(torch.nn.Module):
         TORCH_2_ATTENTION_POSSIBLE = (
             torch.__version__ >= "2" and torch.cuda.is_available()
         )
+        if positions_num_measures > 0:
+            TORCH_2_ATTENTION_POSSIBLE = False
+            use_flash_attention = False
+
         USE_TORCH_2_GQA = False
         if TORCH_2_ATTENTION_POSSIBLE:
             # check whether torch.nn.functional.scaled_dot_product_attention has a
@@ -618,7 +756,7 @@ class MultiHeadAttention(torch.nn.Module):
 
             if qkv is not None:
                 attention_head_outputs = flash_attn_unpadded_qkvpacked_func(  # type: ignore
-                    qkv.reshape(batch_size * seqlen_q, 3, nhead, d_k),
+                    qkv.contiguous().reshape(batch_size * seqlen_q, 3, nhead, d_k),
                     get_seqlen_cumsums(batch_size, seqlen_q, qkv.device),
                     seqlen_q,
                     dropout_p=dropout_p,
@@ -633,8 +771,8 @@ class MultiHeadAttention(torch.nn.Module):
                     share_kv_across_n_heads,
                 )
                 attention_head_outputs = flash_attn_unpadded_kvpacked_func(  # type: ignore
-                    q.reshape(batch_size * seqlen_q, nhead, d_k),
-                    kv.reshape(batch_size * seqlen_kv, 2, nhead, d_k),
+                    q.contiguous().reshape(batch_size * seqlen_q, nhead, d_k),
+                    kv.contiguous().reshape(batch_size * seqlen_kv, 2, nhead, d_k),
                     get_seqlen_cumsums(batch_size, seqlen_q, q.device),
                     get_seqlen_cumsums(batch_size, seqlen_kv, kv.device),
                     seqlen_q,
@@ -662,9 +800,9 @@ class MultiHeadAttention(torch.nn.Module):
                     share_kv_across_n_heads,
                 )
                 attention_head_outputs = flash_attn_unpadded_func(  # type: ignore
-                    q.reshape(batch_size * seqlen_q, nhead, d_k_),  # type: ignore
-                    k.reshape(batch_size * seqlen_kv, nhead, d_k_),  # type: ignore
-                    v.reshape(batch_size * seqlen_kv, nhead, d_v),
+                    q.contiguous().reshape(batch_size * seqlen_q, nhead, d_k_),  # type: ignore
+                    k.contiguous().reshape(batch_size * seqlen_kv, nhead, d_k_),  # type: ignore
+                    v.contiguous().reshape(batch_size * seqlen_kv, nhead, d_v),
                     get_seqlen_cumsums(batch_size, seqlen_q, q.device),
                     get_seqlen_cumsums(batch_size, seqlen_kv, k.device),
                     seqlen_q,
@@ -704,9 +842,58 @@ class MultiHeadAttention(torch.nn.Module):
             )
             attention_head_outputs = attention_head_outputs.transpose(1, 2)
         else:
-            k = MultiHeadAttention.broadcast_kv_across_heads(k, share_kv_across_n_heads)
-            v = MultiHeadAttention.broadcast_kv_across_heads(v, share_kv_across_n_heads)
-            logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
+            k = MultiHeadAttention.broadcast_kv_across_heads(
+                k, share_kv_across_n_heads
+            )  # [b,k,h,d]
+            v = MultiHeadAttention.broadcast_kv_across_heads(
+                v, share_kv_across_n_heads
+            )  # [b,k,h,d]
+            # Prototype: compute pairwise distance metrics without modifying attention
+            if positions_num_measures > 0:
+                assert (
+                    positions.shape[0] == batch_size and positions.shape[1] == seqlen_q
+                ), f"positions (q) shape {positions.shape} incompatible with {(batch_size, seqlen_q)}"
+                assert (
+                    positions_kv.shape[0] == batch_size
+                    and positions_kv.shape[1] == seqlen_kv
+                ), f"positions_kv (kv) shape {positions_kv.shape} incompatible with {(batch_size, seqlen_kv)}"
+                pos_q = positions
+                pos_k = positions_kv
+                # Distance per (q,k)
+                dist = (pos_q[:, :, None] - pos_k[:, None, :]).abs()  # [b,q,k]
+                scales = torch.tensor(
+                    [2**i for i in range(positions_num_measures)],
+                    device=positions.device,
+                    dtype=positions.dtype,
+                )
+                thresholds = (positions_base * scales)[None, None, None, :]
+                # Vector of within-threshold interpolations in [0,1]
+                g = 1.0 - 2.0 * (dist[..., None] / thresholds).clamp(
+                    0.0, 1.0
+                )  # [b,q,k,T]
+                # Direction indicator
+                diff = pos_k[:, None, :] - pos_q[:, :, None]
+                is_right = 2 * (diff >= 0.0).to(q.dtype) - 1  # [b,q,k]
+                is_right[diff == 0.0] = 0.0
+                g = torch.cat([g, is_right[..., None]], dim=-1)  # [b,q,k,T+1]
+                t = g.shape[-1]
+
+                logits = torch.einsum(
+                    "b q h d, b k h d -> b q k h", q[..., :-t], k[..., :-t]
+                )
+                position_available_mask = ~positions.isnan().any(1)  # [b]
+                logits[position_available_mask] += torch.einsum(
+                    "b q h t, b q k t -> b q k h",
+                    q[position_available_mask, ..., -t:],
+                    g[position_available_mask],
+                )
+
+                if dont_look_at_yourself:
+                    logits[:, torch.arange(seqlen_kv), torch.arange(seqlen_kv), :] = (
+                        float("-inf")
+                    )
+            else:
+                logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
             logits *= (
                 torch.sqrt(torch.tensor(1.0 / d_k)).to(k.device)
                 if softmax_scale is None
@@ -714,7 +901,21 @@ class MultiHeadAttention(torch.nn.Module):
             )
             ps = torch.softmax(logits, dim=2)
             ps = torch.dropout(ps, dropout_p, train=True)
-            attention_head_outputs = torch.einsum("b q k h, b k h d -> b q h d", ps, v)
+            if positions_num_measures > 0:
+                attention_head_outputs = torch.einsum(
+                    "b q k h, b k h d -> b q h d", ps, v
+                )
+                attention_head_outputs[position_available_mask, ..., -t:] = (
+                    torch.einsum(
+                        "b q k h, b q k t -> b q h t",
+                        ps[position_available_mask],
+                        g[position_available_mask],
+                    )
+                )
+            else:
+                attention_head_outputs = torch.einsum(
+                    "b q k h, b k h d -> b q h d", ps, v
+                )
 
         return attention_head_outputs.reshape(
             batch_size,
