@@ -569,7 +569,7 @@ class VariableNumFeaturesEncoderStep(SeqEncStep):
         """Transform the input tensor to have a fixed number of features.
 
         Args:
-            x: The input tensor of shape (seq_len, batch_size, num_features_old).
+            x: The input tensor of shape (seq_len, batch_size * n_features, num_features_old).
             **kwargs: Additional keyword arguments (unused).
 
         Returns:
@@ -584,13 +584,22 @@ class VariableNumFeaturesEncoderStep(SeqEncStep):
                 dtype=x.dtype,
             )
         if self.normalize_by_used_features:
+            # number_of_used_features_ has shape (n_features, 1) from _fit
+            # x has shape (seq_len, batch_size * n_features, num_features_old)
+            # Need to broadcast/tile number_of_used_features_ to match batch dimension
+            n_used = self.number_of_used_features_.to(x.device)
+            n_features_cached = n_used.shape[0]
+            if x.shape[1] != n_features_cached and x.shape[1] % n_features_cached == 0:
+                # Batch size differs - tile number_of_used_features_ to match
+                # This happens when using cached training context with larger test batch
+                n_repeats = x.shape[1] // n_features_cached
+                n_used = n_used.repeat(n_repeats, 1)
+
             if self.normalize_by_sqrt:
                 # Verified that this gives indeed unit variance with appended zeros
-                x = x * torch.sqrt(
-                    self.num_features / self.number_of_used_features_.to(x.device),
-                )
+                x = x * torch.sqrt(self.num_features / n_used)
             else:
-                x = x * (self.num_features / self.number_of_used_features_.to(x.device))
+                x = x * (self.num_features / n_used)
 
         zeros_appended = torch.zeros(
             *x.shape[:-1],
